@@ -197,6 +197,9 @@ pub(super) fn from_gltf(path: &Path, max_px: u32) -> Option<Thumbnail> {
                 if !resource.metadata().ok()?.is_file() {
                     return None;
                 }
+                if !crate::fs::content_is_local(&resource) {
+                    return None;
+                }
                 let mut source = File::open(resource).ok()?;
                 let metadata = source.metadata().ok()?;
                 if !metadata.is_file() || metadata.len() < buffer.byte_length as u64 {
@@ -343,7 +346,11 @@ fn local_resource(root: &Path, uri: &str) -> Option<PathBuf> {
     }) {
         return None;
     }
-    let resolved = root.join(relative).canonicalize().ok()?;
+    let candidate = root.join(relative);
+    if !crate::fs::content_is_local(&candidate) {
+        return None;
+    }
+    let resolved = candidate.canonicalize().ok()?;
     resolved.starts_with(root).then_some(resolved)
 }
 

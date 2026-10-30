@@ -14,6 +14,81 @@ use serde::{Deserialize, Serialize};
 
 use crate::Result;
 
+/// Whether file contents can be read without recalling a Windows cloud placeholder.
+/// On Windows, directory enumeration obtains attributes without opening the
+/// file; even an attribute-only open can trigger a provider's recall-on-open.
+/// Failure to obtain attributes and links whose targets are unknown fail closed.
+pub fn content_is_local(path: &Path) -> bool {
+    #[cfg(windows)]
+    {
+        use std::os::windows::ffi::OsStrExt;
+        use windows_sys::Win32::Foundation::INVALID_HANDLE_VALUE;
+        use windows_sys::Win32::Storage::CloudFilters::{
+            CF_PLACEHOLDER_STATE_INVALID, CF_PLACEHOLDER_STATE_PARTIAL,
+            CfGetPlaceholderStateFromAttributeTag,
+        };
+        use windows_sys::Win32::Storage::FileSystem::{
+            FindClose, FindFirstFileW, WIN32_FIND_DATAW,
+        };
+
+        let mut name: Vec<u16> = path.as_os_str().encode_wide().collect();
+        if name.is_empty() || name.contains(&0) {
+            return false;
+        }
+        name.push(0);
+        let mut data: WIN32_FIND_DATAW = unsafe { std::mem::zeroed() };
+        let handle = unsafe { FindFirstFileW(name.as_ptr(), &mut data) };
+        if handle == INVALID_HANDLE_VALUE {
+            return false;
+        }
+        unsafe { FindClose(handle) };
+        // Name-surrogate reparse points (including symbolic links) can hide a
+        // remote target. Do not follow them just to create a preview.
+        if data.dwFileAttributes & 0x400 != 0 && data.dwReserved0 & 0x2000_0000 != 0 {
+            return false;
+        }
+        let state = unsafe {
+            CfGetPlaceholderStateFromAttributeTag(data.dwFileAttributes, data.dwReserved0)
+        };
+        content_attributes_are_local(data.dwFileAttributes)
+            && state != CF_PLACEHOLDER_STATE_INVALID
+            && state & CF_PLACEHOLDER_STATE_PARTIAL == 0
+    }
+    #[cfg(not(windows))]
+    {
+        let _ = path;
+        true
+    }
+}
+
+#[cfg(windows)]
+fn content_attributes_are_local(attributes: u32) -> bool {
+    const OFFLINE: u32 = 0x0000_1000;
+    const RECALL_ON_OPEN: u32 = 0x0004_0000;
+    const RECALL_ON_DATA_ACCESS: u32 = 0x0040_0000;
+    attributes & (OFFLINE | RECALL_ON_OPEN | RECALL_ON_DATA_ACCESS) == 0
+}
+
+#[cfg(all(test, windows))]
+#[test]
+fn cloud_recall_attributes_are_not_local() {
+    assert!(content_attributes_are_local(0x20)); // ordinary archive attribute
+    for flag in [0x1000, 0x40000, 0x400000] {
+        assert!(!content_attributes_are_local(flag));
+        assert!(!content_attributes_are_local(flag | 0x20));
+    }
+    assert!(!content_is_local(Path::new("?:\\nonexistent")));
+}
+
+#[cfg(all(test, windows))]
+#[test]
+fn cloud_placeholder_is_checked_without_opening_it() {
+    if let Some(path) = std::env::var_os("FAVNYR_TEST_ONLINE_ONLY_FILE") {
+        assert!(!content_is_local(Path::new(&path)));
+    }
+    assert!(content_is_local(&std::env::current_exe().unwrap()));
+}
+
 /// Category of a file — drives icon selection on the Slint side.
 ///
 /// The `u8` values are **stable**: they are serialized to Slint

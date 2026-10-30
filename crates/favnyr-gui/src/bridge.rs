@@ -15846,6 +15846,18 @@ fn generate_thumb(path: &Path, kind: FileKind, max_px: u32) -> Option<Thumbnail>
             .map(|e| e.eq_ignore_ascii_case("lnk"))
             .unwrap_or(false)
         {
+            // The Shell follows the shortcut; check its target before asking it
+            // for an image, and fail closed if the target cannot be resolved.
+            let target = openwith::resolve_shortcut(path)?;
+            if !rfs::content_is_local(&target) {
+                return None;
+            }
+            if target
+                .extension()
+                .is_some_and(|ext| ext.eq_ignore_ascii_case("gltf"))
+            {
+                return thumbnail::generate(&target, FileKind::File, max_px);
+            }
             return crate::winthumb::shell_thumbnail(path, max_px);
         }
         match kind {
@@ -15866,6 +15878,14 @@ fn generate_thumb(path: &Path, kind: FileKind, max_px: u32) -> Option<Thumbnail>
                     .or_else(|| crate::winthumb::shell_thumbnail(path, max_px));
             }
             FileKind::File => {
+                // glTF can reference additional files. The core renderer checks
+                // those resources; a Shell fallback could read them unchecked.
+                if path
+                    .extension()
+                    .is_some_and(|ext| ext.eq_ignore_ascii_case("gltf"))
+                {
+                    return thumbnail::generate(path, kind, max_px);
+                }
                 return thumbnail::generate(path, kind, max_px)
                     .or_else(|| crate::winthumb::shell_thumbnail(path, max_px));
             }
@@ -15908,10 +15928,19 @@ fn spawn_thumb_worker(scheduler: Arc<ThumbScheduler>, weak: slint::Weak<MainWind
             let weak_for_ui = weak.clone();
             let scheduler_for_ui = scheduler.clone();
 
+            if !rfs::content_is_local(&job.path) {
+                scheduler.complete(&wait_path, serial);
+                continue;
+            }
+
             if job.svg {
                 let ui_path = job.path;
                 let posted = slint::invoke_from_event_loop(move || {
                     if let Some(w) = weak_for_ui.upgrade() {
+                        if !rfs::content_is_local(&ui_path) {
+                            scheduler_for_ui.complete(&ui_path, serial);
+                            return;
+                        }
                         match Image::load_from_path(&ui_path) {
                             Ok(img) => w.invoke_thumb_ready(path_str.into(), serial, img),
                             Err(_) => scheduler_for_ui.complete(&ui_path, serial),
@@ -16236,6 +16265,9 @@ fn spawn_imgmeta_worker(
     std::thread::spawn(move || {
         while let Ok(job) = rx.recv() {
             if job.r#gen != r#gen.load(Ordering::Relaxed) {
+                continue;
+            }
+            if !rfs::content_is_local(&job.path) {
                 continue;
             }
             let Some((w, h, bits, alpha)) = thumbnail::image_meta(&job.path) else {
@@ -16804,6 +16836,9 @@ fn cached_path_icon(path: &Path, big: bool) -> Option<Image> {
 /// Icon specific to file `path`, cached by path + size. Falls back to
 /// the extension icon if the shell returns nothing.
 fn self_icon(path: &Path, ext: &str, big: bool) -> Image {
+    if !rfs::content_is_local(path) {
+        return ext_app_icon(ext, big);
+    }
     cached_path_icon(path, big).unwrap_or_else(|| ext_app_icon(ext, big))
 }
 
@@ -16854,6 +16889,14 @@ fn resolve_lnk_icon(parent_display: &str, name: &str, big: bool) -> Option<(Imag
     #[cfg(windows)]
     {
         let path = std::path::PathBuf::from(parent_display).join(name);
+        if !rfs::content_is_local(&path) {
+            return None;
+        }
+        if let Some(target) = openwith::resolve_shortcut(&path)
+            && !rfs::content_is_local(&target)
+        {
+            return Some((ext_app_icon("lnk", big), false));
+        }
         let key = path.display().to_string();
         let cached = LNK_TARGET_CACHE.with(|c| c.borrow().get(&key).cloned());
         let resolved = match cached {
@@ -16896,17 +16939,23 @@ fn resolve_lnk_icon(parent_display: &str, name: &str, big: bool) -> Option<(Imag
 fn lnk_thumbnail_kind(lnk_path: &Path) -> Option<FileKind> {
     #[cfg(windows)]
     {
+        if !rfs::content_is_local(lnk_path) {
+            return None;
+        }
         let key = lnk_path.display().to_string();
         let cached = LNK_TARGET_CACHE.with(|c| c.borrow().get(&key).cloned());
         let (is_dir, ext) = match cached {
             Some(v) => v?,
             None => {
-                let resolved = openwith::resolve_shortcut(lnk_path).map(|t| {
+                let resolved = openwith::resolve_shortcut(lnk_path).and_then(|t| {
+                    if !rfs::content_is_local(&t) {
+                        return None;
+                    }
                     let e = t
                         .extension()
                         .map(|x| x.to_string_lossy().to_ascii_lowercase())
                         .unwrap_or_default();
-                    (t.is_dir(), e)
+                    Some((t.is_dir(), e))
                 });
                 LNK_TARGET_CACHE.with(|c| c.borrow_mut().insert(key, resolved.clone()));
                 resolved?
