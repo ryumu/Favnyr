@@ -83,6 +83,17 @@ or an optional extension change.
 
 ## Thumbnails
 
+On Windows, **Settings → Quick preview** lets you choose PowerToys Peek or
+QuickLook. Select an item and press Space in the file list, or choose **Quick
+preview** from its context menu. Peek accepts multiple selected paths with
+PowerToys 0.102 or later. QuickLook previews one item at a time.
+
+Favnyr checks standard installation locations. For a portable installation,
+choose the executable in the same settings card. With the Microsoft Store
+edition of QuickLook, run QuickLook and select its
+[Bridge.exe](https://github.com/QL-Win/QuickLook/wiki/Develop,-build-and-integrate#integrating-with-file-managers)
+as the executable.
+
 Images are decoded in pure Rust :
 
 `.jpg`, `.jpeg`, `.png`, `.gif`, `.webp`, `.bmp`, `.tif`, `.tiff`, `.tga`, `.hdr`, `.ico`

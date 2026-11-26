@@ -4,7 +4,7 @@
 //! It groups the application's global preferences: language, theme,
 //! window dimensions, view behavior, and keyboard shortcuts.
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
 
@@ -22,6 +22,35 @@ pub const MAX_THUMBNAIL_ZOOM: i32 = 8;
 
 fn default_thumbnail_zoom() -> i32 {
     DEFAULT_THUMBNAIL_ZOOM
+}
+
+/// External viewer used by the Windows quick preview action.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum QuickPreviewProvider {
+    PowerToysPeek,
+    QuickLook,
+    #[default]
+    #[serde(other)]
+    Disabled,
+}
+
+impl QuickPreviewProvider {
+    pub fn from_index(index: i32) -> Self {
+        match index {
+            1 => Self::PowerToysPeek,
+            2 => Self::QuickLook,
+            _ => Self::Disabled,
+        }
+    }
+
+    pub fn index(self) -> i32 {
+        match self {
+            Self::Disabled => 0,
+            Self::PowerToysPeek => 1,
+            Self::QuickLook => 2,
+        }
+    }
 }
 
 /// How a workspace load handles changes in the current workspace.
@@ -277,6 +306,11 @@ pub struct Config {
     /// Enabled by default, including for older configurations.
     #[serde(default = "default_true")]
     pub compact_icon_rows_in_preview: bool,
+    pub quick_preview_provider: QuickPreviewProvider,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub peek_executable: Option<PathBuf>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub quicklook_executable: Option<PathBuf>,
     /// Shows the "Modified" date in **UTC** rather than **local time**.
     /// `#[serde(default)]` = `false` keeps local time by default.
     #[serde(default)]
@@ -373,6 +407,9 @@ impl Default for Config {
             workspace_panel_save: Some(WorkspaceLoadPolicy::Ask),
             workspace_shortcut_save: WorkspaceLoadPolicy::Ask,
             compact_icon_rows_in_preview: true,
+            quick_preview_provider: QuickPreviewProvider::Disabled,
+            peek_executable: None,
+            quicklook_executable: None,
             clock_utc: false,
             shell_ctx_menu: true,
             registered_file_types: true,
@@ -684,6 +721,26 @@ mod tests {
             toml::from_str("letter_shortcut_layout = 'klingon'\nlanguage = 'fr'").unwrap();
         assert_eq!(config.letter_layout(), crate::shortcuts::LetterLayout::Off);
         assert_eq!(config.language, Lang::Fr);
+    }
+
+    #[test]
+    fn quick_preview_defaults_off_and_preserves_each_provider_path() {
+        let mut config: Config = toml::from_str("").unwrap();
+        assert_eq!(
+            config.quick_preview_provider,
+            QuickPreviewProvider::Disabled
+        );
+        config.quick_preview_provider = QuickPreviewProvider::QuickLook;
+        config.peek_executable = Some(PathBuf::from("Peek.exe"));
+        config.quicklook_executable = Some(PathBuf::from("Bridge.exe"));
+
+        let saved: Config = toml::from_str(&toml::to_string(&config).unwrap()).unwrap();
+        assert_eq!(
+            saved.quick_preview_provider,
+            QuickPreviewProvider::QuickLook
+        );
+        assert_eq!(saved.peek_executable, config.peek_executable);
+        assert_eq!(saved.quicklook_executable, config.quicklook_executable);
     }
 
     #[test]

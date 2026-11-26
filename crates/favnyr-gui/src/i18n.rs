@@ -257,6 +257,10 @@ fn apply_catalog(window: &MainWindow, c: &HashMap<String, String>) {
     strings.set_settings_ws_panel_hint(g("settings_ws_panel_hint"));
     strings.set_settings_ws_shortcut_hint(g("settings_ws_shortcut_hint"));
     strings.set_settings_compact_preview_label(g("settings_compact_preview_label"));
+    strings.set_quick_preview_label(g("quick_preview_label"));
+    strings.set_quick_preview_disabled(g("quick_preview_disabled"));
+    strings.set_quick_preview_hint(g("quick_preview_hint"));
+    strings.set_quick_preview_automatic(g("quick_preview_automatic"));
     strings.set_settings_thumbnail_zoom_label(g("settings_thumbnail_zoom_label"));
     strings.set_settings_thumbnail_zoom_hint(g("settings_thumbnail_zoom_hint"));
     strings.set_settings_compact_preview_hint(g("settings_compact_preview_hint"));

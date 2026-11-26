@@ -164,6 +164,14 @@ export component MainWindow inherits Window {
     callback ws-shortcut-save-changed(int);
     // Preview mode: compact single-icon rows, enabled by default.
     in-out property <bool> compact-preview-rows-enabled: true;
+    in-out property <int> quick-preview-provider: 0;
+    in property <string> quick-preview-program;
+    property <bool> quick-preview-enabled: root.platform-windows && root.quick-preview-provider != 0;
+    property <bool> quick-preview-space-down: false;
+    callback quick-preview-provider-changed(int);
+    callback quick-preview-browse();
+    callback quick-preview-reset();
+    callback action-quick-preview() -> bool;
     in-out property <int> default-thumbnail-zoom: 2;
     callback default-thumbnail-zoom-changed(int);
     callback zoom-label(int) -> string;
@@ -2192,6 +2200,7 @@ export component MainWindow inherits Window {
         // window to lose focus). The scope keeps focus on wake-up (Slint
         // forwards the activation event to the previously focused element).
         changed has-focus => {
+            if (self.has-focus) { root.quick-preview-space-down = false; }
             if (self.has-focus && root.sidebar-section-drag-active) {
                 root.cancel-sidebar-section-drag();
             }
@@ -2211,7 +2220,10 @@ export component MainWindow inherits Window {
         key-released(event) => {
             if (event.text == Key.Control) { root.ctrl-down = false; }
             if (event.text == Key.Shift) { root.shift-down = false; }
-            if (event.text == Key.Space) { root.folder-open-drag-active = false; }
+            if (event.text == Key.Space) {
+                root.folder-open-drag-active = false;
+                root.quick-preview-space-down = false;
+            }
             root.update-file-drag-action();
             return reject;
         }
@@ -2405,6 +2417,14 @@ export component MainWindow inherits Window {
                     root.perform-action(id);
                     return accept;
                 }
+            }
+            if (root.quick-preview-enabled && self.has-focus && !root.any-overlay-open
+                    && !root.filter-bar-on && !root.file-drag-active && event.text == Key.Space
+                    && !event.modifiers.control && !event.modifiers.alt
+                    && !event.modifiers.meta && !chord-shift) {
+                if (root.quick-preview-space-down) { return accept; }
+                root.quick-preview-space-down = root.action-quick-preview();
+                if (root.quick-preview-space-down) { return accept; }
             }
             // PRINTABLE character outside an overlay → active view's type-ahead
             // filter. Special keys (>= U+F700) and controls (< U+0020) excluded;
@@ -3390,6 +3410,12 @@ export component MainWindow inherits Window {
                 spacing: 0px;
 
                 MenuItem { nav-level: root.ctx-full-nav-level; label: Strings.ctx-open; shortcut: root.menu-shortcuts.open; clicked => { root.ctx-close(); root.action-open(); } }
+                if root.quick-preview-enabled : MenuItem {
+                    nav-level: root.ctx-full-nav-level;
+                    label: Strings.quick-preview-label;
+                    shortcut: "Space";
+                    clicked => { root.ctx-close(); root.action-quick-preview(); }
+                }
                 // File on Windows → "Open as administrator" ("new
                 // tab" would only open the parent folder: not very useful). Otherwise
                 // (folder, multiple selection, or Linux) → "new tab".
@@ -6009,6 +6035,51 @@ export component MainWindow inherits Window {
                                     CheckBox {
                                         checked <=> root.compact-preview-rows-enabled;
                                         toggled => { root.compact-preview-rows-changed(self.checked); }
+                                    }
+                                }
+                            }
+                        }
+
+                        if root.platform-windows : Rectangle {
+                            background: Theme.alternate-background.with-alpha(0.5);
+                            border-radius: 8px;
+                            border-width: 1px;
+                            border-color: Theme.border;
+                            VerticalLayout {
+                                padding: 12px;
+                                spacing: 8px;
+                                HorizontalLayout {
+                                    spacing: 12px;
+                                    Text {
+                                        horizontal-stretch: 1;
+                                        text: Strings.quick-preview-label;
+                                        font-size: 13px;
+                                        font-weight: 600;
+                                        color: Theme.foreground;
+                                    }
+                                    ComboBox {
+                                        model: [Strings.quick-preview-disabled, "PowerToys Peek", "QuickLook"];
+                                        current-index <=> root.quick-preview-provider;
+                                        selected => { root.quick-preview-provider-changed(self.current-index); }
+                                    }
+                                }
+                                Text {
+                                    text: Strings.quick-preview-hint;
+                                    font-size: 11px;
+                                    color: Theme.foreground.with-alpha(0.55);
+                                    wrap: word-wrap;
+                                }
+                                if root.quick-preview-enabled : HorizontalLayout {
+                                    spacing: 8px;
+                                    LineEdit {
+                                        text: root.quick-preview-program == "" ? Strings.quick-preview-automatic : root.quick-preview-program;
+                                        read-only: true;
+                                        horizontal-stretch: 1;
+                                    }
+                                    Button { text: Strings.create-browse; clicked => { root.quick-preview-browse(); } }
+                                    if root.quick-preview-program != "" : Button {
+                                        text: Strings.quick-preview-automatic;
+                                        clicked => { root.quick-preview-reset(); }
                                     }
                                 }
                             }

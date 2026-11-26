@@ -71,6 +71,8 @@ mod bulk_rename;
 mod folder_stats;
 mod item_geometry;
 mod properties;
+#[cfg(windows)]
+mod quick_preview;
 mod recovery;
 #[cfg(windows)]
 mod registered_documents;
@@ -1588,6 +1590,8 @@ pub fn install(window: &MainWindow, state: AppState) {
     window.set_ws_shortcut_save_index(cfg.workspace_shortcut_save.index());
     // Hybrid Previews mode: single-icon types stay compact.
     window.set_compact_preview_rows_enabled(cfg.compact_icon_rows_in_preview);
+    #[cfg(windows)]
+    quick_preview::install(window, &state);
     // Timezone for the "Modified" column (settings): 0 = local time
     // (default), 1 = UTC. The effective offset is cached for the rows.
     window.set_clock_utc_pref(if cfg.clock_utc { 1 } else { 0 });
