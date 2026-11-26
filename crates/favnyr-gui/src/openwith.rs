@@ -388,8 +388,8 @@ mod imp {
         };
         use windows::Win32::UI::Shell::{IShellLinkW, SLGP_RAWPATH, ShellLink};
         use windows::core::Interface;
+        let _apartment = crate::winutil::ComApartment::sta();
         unsafe {
-            let _ = CoInitializeEx(None, COINIT_APARTMENTTHREADED);
             let link: IShellLinkW =
                 CoCreateInstance(&ShellLink, None, CLSCTX_INPROC_SERVER).ok()?;
             let pf: IPersistFile = link.cast().ok()?;
@@ -1033,10 +1033,6 @@ mod imp {
         None
     }
 
-    /// Icon by extension — not implemented on Linux: it would take MIME
-    /// resolution followed by a lookup through the XDG icon theme, which is
-    /// a great deal of work for a per-extension icon. Falls back to the
-    /// generic type icon on the view side.
     pub fn icon_rgba_for_ext(_ext: &str, _big: bool) -> Option<(Vec<u8>, u32, u32)> {
         None
     }

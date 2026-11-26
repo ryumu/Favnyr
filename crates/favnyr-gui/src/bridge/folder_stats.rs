@@ -52,8 +52,7 @@ fn apply_mtime(row: &mut FileRow, mtime: i64, now: i64, lang: Lang) {
 fn delivery_matches_panel(panel: &Panel, delivery: &Delivery, generation: u64) -> bool {
     delivery.generation == generation
         && panel.search.is_none()
-        && !panel.pending_listing
-        && !panel.pending_initial
+        && panel.pending_listing.is_none()
         && panel.displayed_path == delivery.directory
         && panel.tabs.tabs[panel.tabs.active].current_path == delivery.directory
 }
@@ -191,8 +190,7 @@ fn resort_panel(
 ) -> bool {
     let tab = &panel.tabs.tabs[panel.tabs.active];
     if panel.search.is_some()
-        || panel.pending_listing
-        || panel.pending_initial
+        || panel.pending_listing.is_some()
         || panel.displayed_path != tab.current_path
         || panel.folder_stat_entries.is_empty()
         || !date_sort(tab.sort)
@@ -318,8 +316,7 @@ pub(super) fn request_folder_stats(window: &MainWindow, state: &AppState) {
         for (panel_index, panel) in panels.iter().enumerate() {
             let directory = &panel.tabs.tabs[panel.tabs.active].current_path;
             if panel.search.is_some()
-                || panel.pending_initial
-                || panel.pending_listing
+                || panel.pending_listing.is_some()
                 || panel.displayed_path != *directory
                 || favnyr_core::places::is_network_path(directory)
             {
@@ -554,12 +551,9 @@ mod tests {
         };
         assert!(delivery_matches_panel(&panel, &delivery, 4));
         assert!(!delivery_matches_panel(&panel, &delivery, 5));
-        panel.pending_listing = true;
+        panel.pending_listing = Some(PendingListing::new(1));
         assert!(!delivery_matches_panel(&panel, &delivery, 4));
-        panel.pending_listing = false;
-        panel.pending_initial = true;
-        assert!(!delivery_matches_panel(&panel, &delivery, 4));
-        panel.pending_initial = false;
+        panel.pending_listing = None;
         panel.tabs.tabs[0].current_path = PathBuf::from("folder03");
         assert!(!delivery_matches_panel(&panel, &delivery, 4));
         panel.tabs.tabs[0].current_path = PathBuf::from("folder00");

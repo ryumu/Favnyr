@@ -79,8 +79,6 @@ fn rebuilding_rows_preserves_cached_preview_geometry_and_respects_invalidation()
     let context = RowContext {
         lang: Lang::En,
         now_unix: 0,
-        big_icon: false,
-        grid: false,
         zoom: THUMB_DEFAULT_ZOOM,
         compact_icon_rows: true,
         item_spacing: 0,

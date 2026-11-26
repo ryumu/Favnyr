@@ -29,8 +29,7 @@ struct RecoveredFavorite {
 pub(super) fn can_retry(panel: &Panel, now: Instant) -> bool {
     panel.listing_failed
         && panel.tabs.group_page().is_none()
-        && !panel.pending_initial
-        && !panel.pending_listing
+        && panel.pending_listing.is_none()
         && panel.search.is_none()
         && panel
             .last_recovery
@@ -269,12 +268,9 @@ mod tests {
         assert!(!can_retry(&panel, now));
         panel.listing_failed = true;
         assert!(can_retry(&panel, now));
-        panel.pending_listing = true;
+        panel.pending_listing = Some(PendingListing::new(1));
         assert!(!can_retry(&panel, now));
-        panel.pending_listing = false;
-        panel.pending_initial = true;
-        assert!(!can_retry(&panel, now));
-        panel.pending_initial = false;
+        panel.pending_listing = None;
         panel.last_recovery = Some(now);
         assert!(!can_retry(&panel, now + Duration::from_millis(500)));
         assert!(can_retry(&panel, now + VIEW_RETRY_INTERVAL));

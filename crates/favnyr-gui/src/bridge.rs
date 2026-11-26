@@ -8,9 +8,8 @@
 //!   - `notify` watcher on the current folder (auto-refresh),
 //!   - preference persistence (language, theme, window size).
 //!
-//! Fast local listings can be handled on the UI thread. The
-//! initial population, network paths, and expensive work (thumbnails,
-//! recursive mtime, image metadata) are offloaded to background threads.
+//! Directory listings, thumbnails, recursive mtime and image metadata
+//! are offloaded to background threads.
 
 use std::cell::Cell;
 use std::cell::RefCell;
@@ -75,6 +74,8 @@ mod properties;
 mod recovery;
 #[cfg(windows)]
 mod registered_documents;
+#[cfg(windows)]
+mod row_icons;
 mod search;
 mod shutdown;
 mod tabs;
@@ -279,17 +280,7 @@ struct Panel {
     /// USER width of the vertical bar (logical px), set via the
     /// handle. `0` = automatic (clamped 40% formula). Persisted per view.
     vbar_user_w: f32,
-    /// INITIAL listing still awaited from the startup thread: the
-    /// startup population is asynchronous so as not to block the display
-    /// on a slow network path. Cleared by delivery or by any more
-    /// recent listing (navigation, F5, watcher) so as to discard a stale result.
-    pending_initial: bool,
-    /// Ordinary network listing in progress. Distinct from `pending_initial` so
-    /// that a stale initial result can't win a race during an
-    /// A → B → A navigation.
-    pending_listing: bool,
-    /// Identifier of the network request awaited by this panel.
-    listing_gen: u64,
+    pending_listing: Option<PendingListing>,
     /// Child to select after an asynchronous upward navigation.
     pending_select: Option<String>,
     search: Option<search::Session>,
@@ -363,9 +354,7 @@ impl Panel {
             tab_bar_mode: tab_bar_mode.min(3),
             tab_bar_restore_mode: if tab_bar_mode < 3 { tab_bar_mode } else { 0 },
             vbar_user_w: vbar_user_w.max(0.0),
-            pending_initial: false,
-            pending_listing: false,
-            listing_gen: 0,
+            pending_listing: None,
             pending_select: None,
             search: None,
         }
@@ -484,16 +473,33 @@ fn new_row_models() -> (Rc<VecModel<FileRow>>, ModelRc<FileRow>) {
 
 type AsyncListingResult = std::result::Result<(Vec<Entry>, usize), bool>;
 
-/// Send delivery of a network listing. `Err(true)` = access denied; other
-/// errors become an unavailable path, same as in the synchronous path.
+struct PendingListing {
+    serial: u64,
+    cancelled: Arc<AtomicBool>,
+}
+
+impl PendingListing {
+    fn new(serial: u64) -> Self {
+        Self {
+            serial,
+            cancelled: Arc::new(AtomicBool::new(false)),
+        }
+    }
+}
+
+impl Drop for PendingListing {
+    fn drop(&mut self) {
+        self.cancelled.store(true, Ordering::Relaxed);
+    }
+}
+
+/// `Err(true)` means access denied. Other errors mark the path unavailable.
 struct AsyncListingDelivery {
-    panel: usize,
-    r#gen: u64,
+    serial: u64,
     path: PathBuf,
     result: AsyncListingResult,
-    lang: Lang,
-    preserved_selected: Vec<String>,
-    preserved_anchor: Option<String>,
+    manual_order: Option<Vec<String>>,
+    reconciled_order: Option<Vec<String>>,
     recover_favorites: bool,
 }
 
@@ -871,6 +877,8 @@ pub struct AppState {
     thumb_cache: Rc<RefCell<ThumbLru>>,
     /// Coalesces optional-provider geometry updates without a permanent timer.
     thumb_layout_pending: Rc<Cell<bool>>,
+    #[cfg(windows)]
+    row_icons: Rc<row_icons::RowIcons>,
     /// Per-path annotations: the colour assigned to a folder, and the note
     /// attached to an item. Global and written the moment it changes, like the
     /// favorites tree — the data belongs to a path, not to a window layout, so
@@ -1104,6 +1112,8 @@ impl AppState {
             thumb_scheduler: Arc::new(ThumbScheduler::new()),
             thumb_cache: Rc::new(RefCell::new(ThumbLru::new(512))),
             thumb_layout_pending: Rc::new(Cell::new(false)),
+            #[cfg(windows)]
+            row_icons: Rc::default(),
             annotations: Rc::new(RefCell::new(
                 favnyr_core::annotations::AnnotationStore::load(&paths::annotations_path()),
             )),
@@ -1199,6 +1209,8 @@ impl AppState {
             thumb_scheduler: Arc::new(ThumbScheduler::new()),
             thumb_cache: Rc::new(RefCell::new(ThumbLru::new(512))),
             thumb_layout_pending: Rc::new(Cell::new(false)),
+            #[cfg(windows)]
+            row_icons: Rc::default(),
             annotations: Rc::new(RefCell::new(
                 favnyr_core::annotations::AnnotationStore::load(&paths::annotations_path()),
             )),
@@ -4658,7 +4670,7 @@ pub fn install(window: &MainWindow, state: AppState) {
             st.rmtime_cache.borrow_mut().clear();
             st.size_cache.borrow_mut().clear();
             refresh_all_panels(&w, &st);
-            // The rows now exist, so a completed operation can point at its result.
+            // The listing will reveal the completed operation's result.
             apply_focus_after_refresh(&w, &st);
         });
     }
@@ -6062,6 +6074,8 @@ pub fn install(window: &MainWindow, state: AppState) {
     }
 
     install_panel_cycle(window, state.layout.clone(), state.active_panel.clone());
+    #[cfg(windows)]
+    row_icons::RowIcons::install(window, &state);
 
     // Previews / thumbnails -----
     // Starts the scheduler's worker POOL for this application state.
@@ -6870,7 +6884,7 @@ pub fn install(window: &MainWindow, state: AppState) {
             st.persist_workspace();
         });
     }
-    // Delivery of regular network listings. The worker never captures
+    // Delivery of folder listings. The worker never captures
     // the AppState (`Rc`): it pushes a Send value into the queue then simply
     // wakes Slint; all model mutation stays on the UI thread.
     {
@@ -7316,7 +7330,7 @@ pub fn install(window: &MainWindow, state: AppState) {
     // immediately, then a background thread delivers each listing as it comes in.
     // Delays from various network paths thus never block the
     // interface's startup.
-    initial_populate_async(window, &state);
+    list_visible_panels(window, &state, false);
     // The shell menu probe is lazy and only starts when the
     // "Detected Windows entries" sub-tab opens; see `scan_shell_ext`.
     // Window title: "{workspace} — Favnyr" (or "Favnyr") depending on the
@@ -10978,407 +10992,45 @@ fn fav_perform_move(state: &AppState, src_id: &str, target_index: i32, zone: i32
     }
 }
 
-/// ASYNCHRONOUS initial population of the panels. The window is displayed
-/// immediately (empty panels); ONE background thread lists the current folder
-/// of each panel (the ACTIVE one first — perceived priority) and delivers the
-/// results to the UI thread via a channel + `invoke_from_event_loop` (the drain
-/// callback has captured the non-Send `AppState`). Each delivery is applied
-/// only if it's still FRESH (`Panel.pending_initial`, turned off by any
-/// synchronous listing that occurred in the meantime: navigation, F5, watcher…).
-fn initial_populate_async(window: &MainWindow, state: &AppState) {
-    // Jobs frozen on the UI thread (path + view settings of the active tab).
+/// Starts a listing for each visible panel. The active pane is requested first
+/// so it can be populated independently of any slow paths in the other panes.
+fn list_visible_panels(window: &MainWindow, state: &AppState, refresh: bool) {
     let active = *state.active_panel.borrow();
-    let mut jobs: Vec<(usize, PathBuf, bool, SortState, GroupMode, bool)> = Vec::new();
-    {
-        let folder_state = folder_state_now(state);
-        let mut panels = state.panels.borrow_mut();
-        for (i, p) in panels.iter_mut().enumerate() {
-            if p.tabs.group_page().is_some() {
-                p.pending_initial = false;
-                continue;
-            }
-            p.pending_initial = true;
-            let t = &p.tabs.tabs[p.tabs.active];
-            jobs.push((
-                i,
-                t.current_path.clone(),
-                t.show_hidden,
-                t.sort,
-                t.group_mode,
-                folder_state.is_manual(&t.current_path),
-            ));
-        }
-    }
-    if let Some(index) = jobs.iter().position(|job| job.0 == active) {
-        let a = jobs.remove(index);
-        jobs.insert(0, a);
-    }
-    // Empty panels pushed right away → the display no longer waits on the network.
-    update_panels_ui(window, state);
-    if jobs.is_empty() {
-        return;
-    }
-
-    // Delivery: the worker PUSHES (idx, path, sorted result, denied?) then
-    // wakes the UI thread. The (pure) sort is done on the worker; the conversion
-    // to rows (`entry_to_row`: Slint images + icon cache) stays on the UI side.
-    type Delivery = (
-        usize,
-        PathBuf,
-        std::result::Result<(Vec<Entry>, usize), bool>,
-    );
-    let (tx, rx) = mpsc::channel::<Delivery>();
-    {
-        let st = state.clone();
-        let weak = window.as_weak();
-        let rx = Rc::new(RefCell::new(rx));
-        window.on_initial_listing_drain(move || {
-            let Some(w) = weak.upgrade() else { return };
-            while let Ok((idx, path, res)) = rx.borrow().try_recv() {
-                apply_initial_listing(&w, &st, idx, &path, res);
-            }
-        });
-    }
-    let weak = window.as_weak();
-    std::thread::spawn(move || {
-        for (idx, path, show_hidden, sort, group, manual_order) in jobs {
-            let res = match rfs::list_dir_counted(&path, show_hidden || manual_order) {
-                Ok((mut entries, hidden)) => {
-                    rfs::sort_with_secondary(
-                        &mut entries,
-                        sort.column,
-                        sort.order,
-                        group,
-                        sort.secondary,
-                        mtime_offset(),
-                    );
-                    Ok((entries, hidden))
-                }
-                Err(err) => {
-                    error!(error = %err, path = %path.display(), "initial list_dir failed");
-                    // Same distinction as refresh_listing: access denied → toast;
-                    // otherwise → "unavailable" tab (banner + re-check).
-                    Err(matches!(
-                        &err,
-                        favnyr_core::Error::Io(e) if e.kind() == std::io::ErrorKind::PermissionDenied
-                    ))
-                }
-            };
-            if tx.send((idx, path, res)).is_err() {
-                return; // receiver gone (window closed)
-            }
-            let weak = weak.clone();
-            let _ = slint::invoke_from_event_loop(move || {
-                if let Some(w) = weak.upgrade() {
-                    w.invoke_initial_listing_drain();
-                }
-            });
-        }
-    });
-}
-
-/// Applies (UI thread) an initial listing delivered by the startup thread —
-/// ONLY if the panel is still waiting for it (`pending_initial`) and its
-/// active tab still points to the listed path.
-fn apply_initial_listing(
-    window: &MainWindow,
-    state: &AppState,
-    idx: usize,
-    path: &Path,
-    res: std::result::Result<(Vec<Entry>, usize), bool>,
-) {
-    let (lang, compact_icon_rows, item_spacing) = {
-        let config = state.config.borrow();
-        (
-            config.language,
-            config.compact_icon_rows_in_preview,
-            config.view_item_spacing,
-        )
-    };
-    let is_active = idx == *state.active_panel.borrow();
-    let manual_order = folder_state_now(state).is_manual(path);
-    {
-        let mut panels = state.panels.borrow_mut();
-        let Some(p) = panels.get_mut(idx) else { return };
-        let tab = &p.tabs.tabs[p.tabs.active];
-        if !p.pending_initial || tab.current_path != path {
-            return; // stale delivery (the user has already navigated / listed)
-        }
-        let big_icon = tab.preview;
-        let grid = tab.item_arrangement == ItemArrangement::Grid;
-        let zoom = tab.zoom;
-        let group_mode = tab.group_mode;
-        let show_hidden = tab.show_hidden;
-        p.pending_initial = false;
-        p.listing_failed = res.is_err();
-        match res {
-            Ok((mut entries, hidden_count)) => {
-                if manual_order {
-                    apply_manual_order(state, path, &mut entries, show_hidden);
-                }
-                let parent_display = path.display().to_string();
-                let now = now_unix();
-                let rows = entries_to_rows(
-                    &entries,
-                    &parent_display,
-                    &RowContext {
-                        lang,
-                        now_unix: now,
-                        big_icon,
-                        grid,
-                        zoom,
-                        compact_icon_rows,
-                        item_spacing,
-                        group_mode: effective_group_mode(group_mode, manual_order),
-                        annotations: &annotations_now(state),
-                        thumb_cache: Some(&state.thumb_cache),
-                    },
-                );
-                folder_stats::remember_entries(state, p, &entries);
-                p.replace_rows(rows);
-                p.hidden_count = hidden_count;
-                p.unavailable = false;
-                p.last_recovery = None;
-            }
-            Err(denied) => {
-                p.replace_rows(Vec::new());
-                p.hidden_count = 0;
-                p.unavailable = !denied;
-                if denied && is_active {
-                    show_notice(window, i18n::access_denied(lang));
-                }
-            }
-        }
-        p.displayed_path = path.to_path_buf();
-    }
-    update_panels_ui(window, state);
-    // Any delivery may belong to a simultaneously visible view: the
-    // global preview request must therefore be rebuilt even if this panel
-    // isn't active (its listing may have arrived after the active panel's).
-    request_thumbnails(state);
-    // ACTIVE panel: watcher + other background work tied to navigation.
-    request_folder_stats(window, state);
-    if is_active {
-        install_watcher(state, window, path);
-        request_imgmeta(state);
-    }
-}
-
-/// Refreshes each panel after a potentially multi-view operation.
-/// Local folders are re-read directly; any network path, even in
-/// a non-active split, goes through the async worker. The active panel keeps the
-/// full route (`refresh_listing`) for its filter and its watcher.
-fn refresh_all_panels(window: &MainWindow, state: &AppState) {
-    let active_idx = *state.active_panel.borrow();
-    let paths: Vec<PathBuf> = state
-        .panels
-        .borrow()
-        .iter()
-        .map(|panel| panel.tabs.tabs[panel.tabs.active].current_path.clone())
-        .collect();
-
-    let searching: Vec<usize> = state
+    let paths: Vec<_> = state
         .panels
         .borrow()
         .iter()
         .enumerate()
-        .filter_map(|(i, p)| p.search.is_some().then_some(i))
+        .filter(|(_, panel)| panel.tabs.group_page().is_none())
+        .map(|(index, panel)| {
+            (
+                index,
+                panel.tabs.tabs[panel.tabs.active].current_path.clone(),
+            )
+        })
         .collect();
-    let searching: HashSet<usize> = searching
-        .into_iter()
-        .filter(|&index| search::restart(window, state, index))
-        .collect();
-    // First re-read the local panels without publishing the UI between each one.
-    for (index, path) in paths.iter().enumerate() {
-        if index != active_idx
-            && !searching.contains(&index)
-            && !favnyr_core::places::is_network_path(path)
-            && !rfs::is_unc_path(path)
-        {
-            relist_panel(state, index);
-        }
-    }
 
-    // The network panels then start independently. The function publishes
-    // their "in progress" state but performs no I/O on the UI thread.
-    for (index, path) in paths.iter().enumerate() {
-        if index != active_idx
-            && !searching.contains(&index)
-            && (favnyr_core::places::is_network_path(path) || rfs::is_unc_path(path))
-        {
-            request_async_panel_listing(window, state, index, path, String::new(), false);
+    for (index, path) in paths
+        .iter()
+        .filter(|(index, _)| *index == active)
+        .chain(paths.iter().filter(|(index, _)| *index != active))
+    {
+        if path.as_os_str().is_empty() || refresh && search::restart(window, state, *index) {
+            continue;
         }
+        let is_active = *index == active;
+        let filter = if is_active {
+            state.filter.borrow().clone()
+        } else {
+            String::new()
+        };
+        request_async_panel_listing(window, state, *index, path, filter, refresh && is_active);
     }
-
-    let active = paths.get(active_idx).cloned().unwrap_or_default();
-    if searching.contains(&active_idx) {
-        update_panels_ui(window, state);
-        request_thumbnails(state);
-        request_folder_stats(window, state);
-        request_imgmeta(state);
-        return;
-    }
-    if active.as_os_str().is_empty() {
-        update_panels_ui(window, state);
-        request_thumbnails(state);
-        request_folder_stats(window, state);
-        request_imgmeta(state);
-    } else {
-        let active_is_network =
-            favnyr_core::places::is_network_path(&active) || rfs::is_unc_path(&active);
-        refresh_listing(window, state, &active);
-        if active_is_network {
-            // The active listing will arrive later; the local panels already
-            // re-read shouldn't wait on this network share for their visual work.
-            request_thumbnails(state);
-            request_folder_stats(window, state);
-            request_imgmeta(state);
-        }
-    }
+    update_panels_ui(window, state);
 }
 
-/// Re-lists ONE panel (its active tab) — used when an "unavailable"
-/// folder becomes accessible again. Does NOT touch the watcher or the
-/// thumbnails (the caller handles that for the active panel). Leaves the panel
-/// unavailable if the listing still fails.
-fn relist_panel(state: &AppState, i: usize) {
-    let (lang, compact_icon_rows, item_spacing) = {
-        let config = state.config.borrow();
-        (
-            config.language,
-            config.compact_icon_rows_in_preview,
-            config.view_item_spacing,
-        )
-    };
-    let mut panels = state.panels.borrow_mut();
-    let Some(panel) = panels.get_mut(i) else {
-        return;
-    };
-    if panel.search.is_some() || panel.tabs.group_page().is_some() {
-        return;
-    }
-    panel.pending_initial = false; // fresher than the initial population
-    panel.pending_listing = false;
-    panel.pending_select = None;
-    panel.listing_failed = false;
-    let path = panel.tabs.tabs[panel.tabs.active].current_path.clone();
-    let sort = panel.tabs.tabs[panel.tabs.active].sort;
-    let show_hidden = panel.tabs.tabs[panel.tabs.active].show_hidden;
-    let group_mode = panel.tabs.tabs[panel.tabs.active].group_mode;
-    let manual_order = folder_state_now(state).is_manual(&path);
-    let big_icon = panel.tabs.tabs[panel.tabs.active].preview;
-    let grid = panel.tabs.tabs[panel.tabs.active].item_arrangement == ItemArrangement::Grid;
-    let zoom = panel.tabs.tabs[panel.tabs.active].zoom;
-    let ext_on = panel.tabs.tabs[panel.tabs.active].ext_filter_on;
-    let ext_txt = panel.tabs.tabs[panel.tabs.active].ext_filter.clone();
-    let same_dir = panel.displayed_path == path;
-    if !same_dir {
-        panel.reset_rows_viewport();
-    }
-    let selected: std::collections::HashSet<String> = if same_dir {
-        (0..panel.rows_model.row_count())
-            .filter_map(|index| panel.rows_model.row_data(index))
-            .filter(|row| row.selected)
-            .map(|row| row.name.to_string())
-            .collect()
-    } else {
-        std::collections::HashSet::new()
-    };
-    let anchor_name = if same_dir {
-        let anchor = panel.tabs.tabs[panel.tabs.active].selection_anchor;
-        usize::try_from(anchor)
-            .ok()
-            .and_then(|index| panel.rows_model.row_data(index))
-            .map(|row| row.name.to_string())
-    } else {
-        None
-    };
-    match rfs::list_dir_counted(&path, show_hidden || manual_order) {
-        Ok((mut entries, hidden_count)) => {
-            rfs::sort_with_secondary(
-                &mut entries,
-                sort.column,
-                sort.order,
-                group_mode,
-                sort.secondary,
-                mtime_offset(),
-            );
-            if manual_order {
-                apply_manual_order(state, &path, &mut entries, show_hidden);
-            }
-            // After the manual order, which needs the complete listing to
-            // reconcile: filtering first would drop the hidden names from the
-            // stored order.
-            apply_ext_filter(&mut entries, ext_on, &ext_txt);
-            let parent_display = path.display().to_string();
-            let now = now_unix();
-            let mut rows = entries_to_rows(
-                &entries,
-                &parent_display,
-                &RowContext {
-                    lang,
-                    now_unix: now,
-                    big_icon,
-                    grid,
-                    zoom,
-                    compact_icon_rows,
-                    item_spacing,
-                    group_mode: effective_group_mode(group_mode, manual_order),
-                    annotations: &annotations_now(state),
-                    thumb_cache: Some(&state.thumb_cache),
-                },
-            );
-            for row in &mut rows {
-                row.selected = selected.contains(row.name.as_str());
-            }
-            {
-                let clipboard = state.clipboard.borrow();
-                if matches!(clipboard.op, Some(ClipOp::Cut)) {
-                    let cut_names: std::collections::HashSet<&str> = clipboard
-                        .paths
-                        .iter()
-                        .filter(|candidate| candidate.parent() == Some(path.as_path()))
-                        .filter_map(|candidate| {
-                            candidate.file_name().and_then(|name| name.to_str())
-                        })
-                        .collect();
-                    for row in &mut rows {
-                        row.cut = cut_names.contains(row.name.as_str());
-                    }
-                }
-            }
-            let anchor = anchor_name
-                .as_deref()
-                .and_then(|name| rows.iter().position(|row| row.name.as_str() == name))
-                .map(|index| index as i32)
-                .unwrap_or(-1);
-            folder_stats::remember_entries(state, panel, &entries);
-            panel.replace_rows(rows);
-            let active = panel.tabs.active;
-            panel.tabs.tabs[active].selection_anchor = anchor;
-            panel.tabs.tabs[active].cursor = anchor;
-            panel.hidden_count = hidden_count;
-            panel.unavailable = false;
-            panel.last_recovery = None;
-            panel.displayed_path = path;
-        }
-        Err(err) => {
-            let denied = matches!(
-                &err,
-                favnyr_core::Error::Io(io)
-                    if io.kind() == std::io::ErrorKind::PermissionDenied
-            );
-            error!(error = %err, path = %path.display(), "panel relist failed");
-            panel.replace_rows(Vec::new());
-            let active = panel.tabs.active;
-            panel.tabs.tabs[active].selection_anchor = -1;
-            panel.tabs.tabs[active].cursor = -1;
-            panel.hidden_count = 0;
-            panel.unavailable = !denied;
-            panel.listing_failed = true;
-            panel.displayed_path = path;
-        }
-    }
+fn refresh_all_panels(window: &MainWindow, state: &AppState) {
+    list_visible_panels(window, state, true);
 }
 
 /// Retry unavailable paths after a mount change, without probing the network
@@ -12818,9 +12470,7 @@ thread_local! {
 
 /// Requests the re-listing that follows a completed operation.
 ///
-/// `refresh_all_panels` re-reads every local panel synchronously, so running it
-/// once per completion would be wasteful now that operations finish
-/// independently. Restarting a single-shot timer collapses a burst into one
+/// Operations finish independently. Restarting a single-shot timer collapses a burst into one
 /// pass. A stream of completions closer together than the delay keeps pushing
 /// it back, which is the intended trade: the views stay untouched while things
 /// are still moving, then catch up in a single re-listing.
@@ -13419,23 +13069,15 @@ fn listing_denied(r: &Result<(Vec<Entry>, usize), favnyr_core::Error>) -> bool {
     )
 }
 
-/// Routes network paths to a worker. Local listings keep the
-/// proven synchronous path, limiting the behavior change to the only
-/// I/O likely to block for a long time (SMB, mapped drive, UNC).
 fn refresh_listing(window: &MainWindow, state: &AppState, path: &Path) {
     if state.with_tabs(|book| book.group_page().is_some()) {
         update_panels_ui(window, state);
         return;
     }
-    if search::refresh(window, state, path) {
-        return;
-    }
-    if favnyr_core::places::is_network_path(path) || rfs::is_unc_path(path) {
+    if !search::refresh(window, state, path) {
         let panel_idx = *state.active_panel.borrow();
         let name_filter = state.filter.borrow().clone();
         request_async_panel_listing(window, state, panel_idx, path, name_filter, true);
-    } else {
-        refresh_listing_sync(window, state, path);
     }
 }
 
@@ -13456,100 +13098,83 @@ fn request_async_panel_listing(
         return;
     }
     let path = path.to_path_buf();
-    let lang = state.snapshot_config().language;
-    let manual_order = folder_state_now(state).is_manual(&path);
-
-    let (
-        same_dir,
-        show_hidden,
-        sort,
-        group,
-        manual_order,
-        ext_on,
-        ext_text,
-        preserved_selected,
-        preserved_anchor,
-        recover_favorites,
-    ) = {
+    let manual_order = folder_state_now(state).order(&path).map(<[String]>::to_vec);
+    let serial = state.listing_serial.fetch_add(1, Ordering::Relaxed) + 1;
+    let request = PendingListing::new(serial);
+    let cancelled = request.cancelled.clone();
+    let (show_hidden, sort, group, ext_on, ext_text, recover_favorites) = {
         let mut panels = state.panels.borrow_mut();
         let Some(panel) = panels.get_mut(panel_idx) else {
             return;
         };
-        let active = panel.tabs.active;
-        let tab = &mut panel.tabs.tabs[active];
-        tab.current_path = path.clone();
         let same_dir = panel.displayed_path == path;
-        let model = panel.rows_model.clone();
-        let selected = if same_dir {
-            (0..model.row_count())
-                .filter_map(|i| model.row_data(i))
-                .filter(|row| row.selected)
-                .map(|row| row.name.to_string())
-                .collect()
-        } else {
-            Vec::new()
-        };
-        let anchor = if same_dir && tab.selection_anchor >= 0 {
-            model
-                .row_data(tab.selection_anchor as usize)
-                .map(|row| row.name.to_string())
-        } else {
-            None
-        };
-        (
-            same_dir,
+        let recover_favorites = panel.listing_failed
+            || (!same_dir
+                && (rfs::is_unc_path(&path) || favnyr_core::places::is_network_path(&path)));
+        panel.pending_listing = Some(request);
+        panel.displayed_path = path.clone();
+        panel.unavailable = false;
+        let tab = &mut panel.tabs.tabs[panel.tabs.active];
+        tab.current_path = path.clone();
+        if !same_dir {
+            tab.selection_anchor = -1;
+            tab.cursor = -1;
+        }
+        let settings = (
             tab.show_hidden,
             tab.sort,
             tab.group_mode,
-            manual_order,
             tab.ext_filter_on,
             tab.ext_filter.clone(),
-            selected,
-            anchor,
-            !same_dir || panel.listing_failed,
-        )
-    };
-
-    let r#gen = state.listing_serial.fetch_add(1, Ordering::SeqCst) + 1;
-    {
-        let mut panels = state.panels.borrow_mut();
-        let Some(panel) = panels.get_mut(panel_idx) else {
-            return;
-        };
-        panel.pending_initial = false;
-        panel.pending_listing = true;
-        panel.listing_gen = r#gen;
-        panel.pending_select = None;
-        panel.displayed_path = path.clone();
-        panel.unavailable = false;
-        let active = panel.tabs.active;
-        panel.tabs.tabs[active].current_path = path.clone();
+            recover_favorites,
+        );
         if !same_dir {
+            panel.pending_select = None;
             panel.last_recovery = None;
             panel.reset_rows_viewport();
             panel.replace_rows(Vec::new());
             panel.hidden_count = 0;
-            panel.tabs.tabs[active].selection_anchor = -1;
         }
-    }
-    // Only the active panel has a watcher. Refreshing a non-active
-    // split must not invalidate the one used by the active view.
+        settings
+    };
     if panel_idx == *state.active_panel.borrow() {
         state.watcher_gen.fetch_add(1, Ordering::SeqCst);
     }
     update_panels_ui(window, state);
+    debug!(%serial, path = %path.display(), "directory listing requested");
 
     let queue = state.async_listings.clone();
     let weak = window.as_weak();
+    // A newer request must be able to finish even when an earlier system
+    // directory read is still blocked. Obsolete scans stop between entries.
     std::thread::spawn(move || {
-        let mut listing = rfs::list_dir_counted(&path, show_hidden || manual_order);
-        if authenticate
+        let stopped = || cancelled.load(Ordering::Relaxed);
+        let read = || {
+            let mut entries = Vec::new();
+            let hidden = rfs::visit_dir_while(
+                &path,
+                show_hidden || manual_order.is_some(),
+                stopped,
+                |entry| entries.push(entry),
+            )?;
+            Ok((entries, hidden))
+        };
+        if stopped() {
+            return;
+        }
+        let mut listing = read();
+        if !stopped()
+            && authenticate
             && listing_denied(&listing)
             && rfs::is_unc_path(&path)
             && favnyr_core::places::net_connect_prompt(&net_connect_target(&path))
         {
-            listing = rfs::list_dir_counted(&path, show_hidden || manual_order);
+            listing = read();
         }
+        if stopped() {
+            return;
+        }
+        let mut reconciled_order = None;
         let result = match listing {
             Ok((mut entries, hidden)) => {
                 rfs::sort_with_secondary(
@@ -13560,103 +13185,136 @@ fn request_async_panel_listing(
                     sort.secondary,
                     mtime_offset(),
                 );
-                if !manual_order {
-                    apply_name_filter(&mut entries, &name_filter);
-                    apply_ext_filter(&mut entries, ext_on, &ext_text);
+                if let Some(order) = &manual_order {
+                    reconciled_order = sort_manual_listing(&mut entries, order, show_hidden);
                 }
+                apply_name_filter(&mut entries, &name_filter);
+                apply_ext_filter(&mut entries, ext_on, &ext_text);
                 Ok((entries, hidden))
             }
             Err(err) => {
-                let denied = matches!(
-                    &err,
-                    favnyr_core::Error::Io(e)
-                        if e.kind() == std::io::ErrorKind::PermissionDenied
-                );
-                error!(error = %err, path = %path.display(), "async network list_dir failed");
+                let denied = matches!(&err, favnyr_core::Error::Io(e)
+                    if e.kind() == std::io::ErrorKind::PermissionDenied);
+                error!(error = %err, path = %path.display(), "directory listing failed");
                 Err(denied)
             }
         };
+        if stopped() {
+            return;
+        }
         let delivery = AsyncListingDelivery {
-            panel: panel_idx,
-            r#gen,
+            serial,
             path,
             result,
-            lang,
-            preserved_selected,
-            preserved_anchor,
+            manual_order,
+            reconciled_order,
             recover_favorites,
         };
-        let queued = queue
-            .lock()
-            .map(|mut pending| pending.push_back(delivery))
-            .is_ok();
-        if queued {
-            let _ = slint::invoke_from_event_loop(move || {
-                if let Some(w) = weak.upgrade() {
-                    w.invoke_async_listing_drain();
-                }
-            });
+        if let Ok(mut pending) = queue.lock() {
+            pending.push_back(delivery);
+        } else {
+            return;
         }
+        let _ = weak.upgrade_in_event_loop(|window| window.invoke_async_listing_drain());
     });
 }
 
+fn sort_manual_listing(
+    entries: &mut Vec<Entry>,
+    previous: &[String],
+    show_hidden: bool,
+) -> Option<Vec<String>> {
+    let names: Vec<String> = entries.iter().map(|entry| entry.name.clone()).collect();
+    let mut order = previous.to_vec();
+    let changed = FolderStateStore::reconcile_order(&mut order, &names);
+    let ranks: HashMap<_, _> = order
+        .iter()
+        .enumerate()
+        .map(|(rank, name)| (name.as_str(), rank))
+        .collect();
+    entries.sort_by_key(|entry| {
+        ranks
+            .get(entry.name.as_str())
+            .copied()
+            .unwrap_or(usize::MAX)
+    });
+    if !show_hidden {
+        entries.retain(|entry| !entry.hidden);
+    }
+    changed.then_some(order)
+}
+
 fn apply_async_listing(window: &MainWindow, state: &AppState, delivery: AsyncListingDelivery) {
+    // A split can shift indices while its worker is still running. The serial
+    // belongs to the panel that requested it, regardless of its current index.
+    let index = state
+        .panels
+        .borrow()
+        .iter()
+        .position(|panel| async_listing_is_current(panel, delivery.serial, &delivery.path));
+    let Some(index) = index else {
+        debug!(serial = delivery.serial, path = %delivery.path.display(), "discarded obsolete directory listing");
+        return;
+    };
+    let is_active = index == *state.active_panel.borrow();
+    let manual_order_changed = {
+        let mut folders = folder_state_for_update(state);
+        if folders.order(&delivery.path) != delivery.manual_order.as_deref() {
+            true
+        } else {
+            if let Some(order) = delivery.reconciled_order
+                && let Some(current) = folders.order_mut(&delivery.path)
+            {
+                *current = order;
+                save_folder_state(state, &folders);
+            }
+            false
+        }
+    };
+    if manual_order_changed {
+        let filter = if is_active {
+            state.filter.borrow().clone()
+        } else {
+            String::new()
+        };
+        request_async_panel_listing(window, state, index, &delivery.path, filter, false);
+        return;
+    }
+
     let succeeded = delivery.result.is_ok();
-    let is_active = delivery.panel == *state.active_panel.borrow();
-    let (compact_icon_rows, item_spacing) = {
+    let (lang, compact_icon_rows, item_spacing) = {
         let config = state.config.borrow();
         (
+            config.language,
             config.compact_icon_rows_in_preview,
             config.view_item_spacing,
         )
     };
-    let manual_order = folder_state_now(state).is_manual(&delivery.path);
+    let manual_order = delivery.manual_order.is_some();
     let mut denied_notice = false;
     let mut count = 0usize;
-    let pending_focus = {
+    {
         let mut panels = state.panels.borrow_mut();
-        let Some(panel) = panels.get_mut(delivery.panel) else {
-            return;
-        };
+        let panel = &mut panels[index];
         let active = panel.tabs.active;
-        if !async_listing_is_current(panel, delivery.r#gen, &delivery.path) {
-            return; // stale response: a more recent navigation has won
-        }
         let zoom = panel.tabs.tabs[active].zoom;
         let group_mode = panel.tabs.tabs[active].group_mode;
-        let show_hidden = panel.tabs.tabs[active].show_hidden;
-        // Read from the borrow already held: the filters applied below cannot
-        // reach for the panels a second time without tripping over it.
-        let ext_on = panel.tabs.tabs[active].ext_filter_on;
-        let ext_txt = panel.tabs.tabs[active].ext_filter.clone();
-        panel.pending_listing = false;
+        panel.pending_listing = None;
         panel.listing_failed = !succeeded;
         if succeeded {
             panel.last_recovery = None;
         }
         let pending_select = panel.pending_select.take();
-        let pending_focus = pending_select.clone();
         match delivery.result {
-            Ok((mut entries, hidden_count)) => {
-                if manual_order {
-                    apply_manual_order(state, &delivery.path, &mut entries, show_hidden);
-                    // The worker leaves a manual-order listing whole, so the
-                    // reconciliation above sees every name, hidden ones
-                    // included. Filtering therefore happens here instead, once
-                    // the stored order is out of reach.
-                    apply_name_filter(&mut entries, &state.filter.borrow());
-                    apply_ext_filter(&mut entries, ext_on, &ext_txt);
-                }
+            Ok((entries, hidden_count)) => {
                 let parent_display = delivery.path.display().to_string();
                 let now = now_unix();
                 let mut rows = entries_to_rows(
                     &entries,
                     &parent_display,
                     &RowContext {
-                        lang: delivery.lang,
+                        lang,
                         now_unix: now,
-                        big_icon: panel.tabs.tabs[active].preview,
-                        grid: panel.tabs.tabs[active].item_arrangement == ItemArrangement::Grid,
                         zoom,
                         compact_icon_rows,
                         item_spacing,
@@ -13666,27 +13324,32 @@ fn apply_async_listing(window: &MainWindow, state: &AppState, delivery: AsyncLis
                     },
                 );
 
-                let selected: std::collections::HashSet<&str> = delivery
-                    .preserved_selected
-                    .iter()
-                    .map(String::as_str)
-                    .collect();
-                for row in &mut rows {
-                    if selected.contains(row.name.as_str()) {
-                        row.selected = true;
-                    }
-                }
+                // Same-folder refresh keeps the old rows interactive while
+                // the worker runs. Preserve the selection as it is now.
                 let select_pending = pending_select.is_some();
-                let anchor_name = pending_select.or(delivery.preserved_anchor);
+                let anchor_name = pending_select.or_else(|| {
+                    usize::try_from(panel.tabs.tabs[active].selection_anchor)
+                        .ok()
+                        .and_then(|index| panel.rows_model.row_data(index))
+                        .map(|row| row.name.to_string())
+                });
+                let selected: HashSet<_> = panel
+                    .rows_model
+                    .iter()
+                    .filter(|row| row.selected)
+                    .map(|row| row.name.to_string())
+                    .collect();
                 let anchor = anchor_name
                     .as_deref()
                     .and_then(|name| rows.iter().position(|row| row.name.as_str() == name))
                     .map(|idx| idx as i32)
                     .unwrap_or(-1);
-                if select_pending {
-                    for row in &mut rows {
-                        row.selected = Some(row.name.as_str()) == anchor_name.as_deref();
-                    }
+                for row in &mut rows {
+                    row.selected = if select_pending {
+                        Some(row.name.as_str()) == anchor_name.as_deref()
+                    } else {
+                        selected.contains(row.name.as_str())
+                    };
                 }
 
                 let clip = state.clipboard.borrow();
@@ -13708,6 +13371,9 @@ fn apply_async_listing(window: &MainWindow, state: &AppState, delivery: AsyncLis
                 panel.replace_rows(rows);
                 panel.tabs.tabs[active].selection_anchor = anchor;
                 panel.tabs.tabs[active].cursor = anchor;
+                if select_pending && anchor >= 0 {
+                    panel.tabs.tabs[active].scroll_gen += 1;
+                }
                 panel.hidden_count = hidden_count;
                 panel.unavailable = false;
             }
@@ -13721,19 +13387,15 @@ fn apply_async_listing(window: &MainWindow, state: &AppState, delivery: AsyncLis
             }
         }
         panel.displayed_path = delivery.path.clone();
-        pending_focus
-    };
+    }
     if denied_notice {
-        show_notice(window, i18n::access_denied(delivery.lang));
+        show_notice(window, i18n::access_denied(lang));
     }
     if succeeded && delivery.recover_favorites {
         recovery::request_favorites(window, state);
     }
     update_panels_ui(window, state);
-    if let Some(name) = pending_focus {
-        schedule_focus_entry_by_name(window, state, delivery.path.clone(), name);
-    }
-    // The panel may have become inactive during the network listing while
+    // The panel may have become inactive during the listing while
     // remaining visible in the split: its previews must still start.
     request_thumbnails(state);
     request_folder_stats(window, state);
@@ -13741,222 +13403,20 @@ fn apply_async_listing(window: &MainWindow, state: &AppState, delivery: AsyncLis
     if is_active {
         install_watcher(state, window, &delivery.path);
     }
-    debug!(path = %delivery.path.display(), count, "async network listing applied");
+    debug!(serial = delivery.serial, path = %delivery.path.display(), count, "directory listing applied");
 }
 
-fn async_listing_is_current(panel: &Panel, r#gen: u64, path: &Path) -> bool {
-    panel.pending_listing
-        && panel.listing_gen == r#gen
+fn async_listing_is_current(panel: &Panel, serial: u64, path: &Path) -> bool {
+    panel.tabs.group_page().is_none()
+        && panel
+            .pending_listing
+            .as_ref()
+            .is_some_and(|request| request.serial == serial)
         && panel
             .tabs
             .tabs
             .get(panel.tabs.active)
             .is_some_and(|tab| tab.current_path == path)
-}
-
-fn refresh_listing_sync(window: &MainWindow, state: &AppState, path: &Path) {
-    let cfg = state.snapshot_config();
-    let lang = cfg.language;
-
-    // Same-dir = the active panel's `displayed_path` hasn't changed.
-    let active_idx = *state.active_panel.borrow();
-    let same_dir = {
-        let mut panels = state.panels.borrow_mut();
-        // Synchronous listing is fresher than the deferred initial population.
-        panels[active_idx].pending_initial = false;
-        panels[active_idx].pending_listing = false;
-        panels[active_idx].pending_select = None;
-        let active = panels[active_idx].tabs.active;
-        panels[active_idx].tabs.tabs[active].current_path = path.to_path_buf();
-        let same_dir = panels[active_idx].displayed_path == path;
-        if !same_dir {
-            panels[active_idx].reset_rows_viewport();
-        }
-        same_dir
-    };
-
-    // Preservation: we read from the active panel's model if same_dir.
-    let model = state.active_rows_model();
-    let (preserved_selected, preserved_anchor_name) = if same_dir {
-        let preserved: Vec<String> = (0..model.row_count())
-            .filter_map(|i| model.row_data(i))
-            .filter(|r| r.selected)
-            .map(|r| r.name.to_string())
-            .collect();
-        let anchor_name = state.with_tabs(|book| {
-            let a = book.active;
-            let anchor = book.tabs[a].selection_anchor;
-            if anchor >= 0 {
-                model.row_data(anchor as usize).map(|r| r.name.to_string())
-            } else {
-                None
-            }
-        });
-        (preserved, anchor_name)
-    } else {
-        (Vec::new(), None)
-    };
-
-    let show_hidden = state.with_tabs(|book| {
-        let tab = &book.tabs[book.active];
-        tab.show_hidden
-    });
-    let manual_order = folder_state_now(state).is_manual(path);
-    // Local listing only. `refresh_listing` routes every network path to the
-    // asynchronous version, which is where the system credentials prompt and
-    // its retry live — a copy of them here could never run, since the path is
-    // local by construction, and a blocking prompt has no business on this
-    // thread anyway.
-    let (mut entries, hidden_count) = match rfs::list_dir_counted(path, show_hidden || manual_order)
-    {
-        Ok(ec) => ec,
-        Err(err) => {
-            error!(error = %err, path = %path.display(), "list_dir failed");
-            // An access denial on a protected folder produces a notification
-            // instead of being presented as an empty list. Detected via io::Error.
-            let denied = matches!(
-                &err,
-                favnyr_core::Error::Io(e) if e.kind() == std::io::ErrorKind::PermissionDenied
-            );
-            // Everything that ISN'T an access denial (missing path, network drive
-            // not started, mount gone) → "unavailable" tab: we keep the
-            // path + a persistent banner + auto re-check.
-            let unavailable = !denied;
-            if denied {
-                show_notice(window, i18n::access_denied(lang));
-            }
-            {
-                let panels = state.panels.borrow();
-                panels[active_idx].replace_rows(Vec::new());
-            }
-            state.with_tabs_mut(|book| {
-                let a = book.active;
-                book.tabs[a].selection_anchor = -1;
-                book.tabs[a].current_path = path.to_path_buf();
-            });
-            {
-                let mut panels = state.panels.borrow_mut();
-                panels[active_idx].displayed_path = path.to_path_buf();
-                panels[active_idx].hidden_count = 0;
-                panels[active_idx].unavailable = unavailable;
-                panels[active_idx].listing_failed = true;
-            }
-            install_watcher(state, window, path);
-            update_panels_ui(window, state);
-            return;
-        }
-    };
-
-    let sort_state = state.with_tabs(|book| {
-        let a = book.active;
-        book.tabs[a].sort
-    });
-    let group_mode = state.with_tabs(|book| book.tabs[book.active].group_mode);
-    let big_icon = state.with_tabs(|book| book.tabs[book.active].preview);
-    let grid =
-        state.with_tabs(|book| book.tabs[book.active].item_arrangement == ItemArrangement::Grid);
-    let zoom = state.with_tabs(|book| book.tabs[book.active].zoom);
-    rfs::sort_with_secondary(
-        &mut entries,
-        sort_state.column,
-        sort_state.order,
-        group_mode,
-        sort_state.secondary,
-        mtime_offset(),
-    );
-    if manual_order {
-        apply_manual_order(state, path, &mut entries, show_hidden);
-    }
-
-    // Active view's "type-ahead" filter: searches for the fragment anywhere
-    // in the name (case-insensitive). It runs after the manual order has been
-    // reconciled, so hiding entries never reaches the stored order.
-    apply_name_filter(&mut entries, &state.filter.borrow());
-    // Extension filter — orthogonal to type-ahead; doesn't touch
-    // folders. Read from the active tab.
-    {
-        let (on, txt) = state.with_tabs(|book| {
-            let a = book.active;
-            (book.tabs[a].ext_filter_on, book.tabs[a].ext_filter.clone())
-        });
-        apply_ext_filter(&mut entries, on, &txt);
-    }
-
-    let parent_display = path.display().to_string();
-    let now = now_unix();
-    let mut rows = entries_to_rows(
-        &entries,
-        &parent_display,
-        &RowContext {
-            lang,
-            now_unix: now,
-            big_icon,
-            grid,
-            zoom,
-            compact_icon_rows: cfg.compact_icon_rows_in_preview,
-            item_spacing: cfg.view_item_spacing,
-            group_mode: effective_group_mode(group_mode, manual_order),
-            annotations: &annotations_now(state),
-            thumb_cache: Some(&state.thumb_cache),
-        },
-    );
-
-    if !preserved_selected.is_empty() {
-        let set: std::collections::HashSet<&str> =
-            preserved_selected.iter().map(|s| s.as_str()).collect();
-        for r in rows.iter_mut() {
-            if set.contains(r.name.as_str()) {
-                r.selected = true;
-            }
-        }
-    }
-    {
-        let clip = state.clipboard.borrow();
-        if matches!(clip.op, Some(ClipOp::Cut)) {
-            let cut_names: std::collections::HashSet<&str> = clip
-                .paths
-                .iter()
-                .filter(|p| p.parent() == Some(path))
-                .filter_map(|p| p.file_name().and_then(|n| n.to_str()))
-                .collect();
-            for r in rows.iter_mut() {
-                if cut_names.contains(r.name.as_str()) {
-                    r.cut = true;
-                }
-            }
-        }
-    }
-
-    let count = rows.len();
-    let new_anchor: i32 = preserved_anchor_name
-        .and_then(|n| rows.iter().position(|r| r.name.as_str() == n))
-        .map(|p| p as i32)
-        .unwrap_or(-1);
-
-    state.with_tabs_mut(|book| {
-        let a = book.active;
-        let t = &mut book.tabs[a];
-        t.current_path = path.to_path_buf();
-        t.selection_anchor = new_anchor;
-        t.cursor = new_anchor;
-    });
-    {
-        let mut panels = state.panels.borrow_mut();
-        folder_stats::remember_entries(state, &mut panels[active_idx], &entries);
-        panels[active_idx].replace_rows(rows);
-        panels[active_idx].displayed_path = path.to_path_buf();
-        panels[active_idx].hidden_count = hidden_count;
-        panels[active_idx].unavailable = false; // listing OK → available again
-        panels[active_idx].listing_failed = false;
-        panels[active_idx].last_recovery = None;
-    }
-
-    install_watcher(state, window, path);
-    update_panels_ui(window, state);
-    request_thumbnails(state);
-    request_folder_stats(window, state);
-    request_imgmeta(state);
-    debug!(path = %path.display(), count, "listing refreshed");
 }
 
 /// How many entries went, in the reader's own grammar.
@@ -14244,11 +13704,11 @@ fn update_panels_ui(window: &MainWindow, state: &AppState) {
             let selected = count_selected(&*p.rows_model) as usize;
             // "Hidden" reminder only when hidden items are NOT shown.
             let hidden = if tab.show_hidden { 0 } else { p.hidden_count };
-            // Initial listing still in flight (async startup):
+            // Listing still in flight:
             // "…" rather than a misleading "Empty folder".
             let footer: SharedString = if p.search.is_some() {
                 search::footer(p, lang, selected).into()
-            } else if p.pending_initial || p.pending_listing {
+            } else if p.pending_listing.is_some() {
                 "…".into()
             } else {
                 i18n::footer_text(lang, total, selected, hidden).into()
@@ -14419,6 +13879,8 @@ fn update_panels_ui(window: &MainWindow, state: &AppState) {
     // tab state changes. The comparison is purely in-memory, so the
     // title stays reactive without hooking any I/O into UI interactions.
     update_window_title(window, state);
+    #[cfg(windows)]
+    row_icons::RowIcons::refresh(state);
 }
 
 /// Updates the window's OS title (taskbar / Alt-Tab):.
@@ -15244,6 +14706,8 @@ fn invalidate_thumbnail_paths(state: &AppState, paths: &[PathBuf]) {
         return;
     }
     let unique: HashSet<PathBuf> = paths.iter().cloned().collect();
+    #[cfg(windows)]
+    state.row_icons.invalidate_paths(&unique);
     {
         let mut cache = state.thumb_cache.borrow_mut();
         for path in &unique {
@@ -15317,8 +14781,13 @@ fn generate_thumb(
             .map(|e| e.eq_ignore_ascii_case("lnk"))
             .unwrap_or(false)
         {
-            let target = link_target?;
-            if !crate::cloud_content_guard::may_read_automatically(target) {
+            let expected = link_target?;
+            let shortcut = cached_link_target(path)?;
+            let target = shortcut.path.as_path();
+            if shortcut.is_dir
+                || target != expected
+                || !crate::cloud_content_guard::may_read_automatically(target)
+            {
                 return None;
             }
             if let Some(format) = target
@@ -15616,6 +15085,25 @@ fn promote_cached_previews(state: &AppState) {
     }
 }
 
+fn thumbnail_kind_for_file_row(
+    state: &AppState,
+    row: &FileRow,
+    path: &Path,
+) -> Option<(FileKind, bool, Option<PathBuf>)> {
+    #[cfg(windows)]
+    if row.ext == "lnk" {
+        // The row-icon worker resolves shortcut targets. The shell thumbnail
+        // decoder can then follow the link without a lookup on the UI thread.
+        return state
+            .row_icons
+            .shortcut_preview(path)
+            .map(|(kind, target)| (kind, false, Some(target)));
+    }
+    #[cfg(not(windows))]
+    let _ = (state, path);
+    thumbnail_kind_for_row(row.kind, row.ext.as_str()).map(|(kind, svg)| (kind, svg, None))
+}
+
 /// Merges a local request before touching the shared scheduler. The same
 /// image can appear in several panels; all its locations are
 /// kept, but the decoding stays unique.
@@ -15755,14 +15243,9 @@ fn request_thumbnails(state: &AppState) {
             }
             // Resolve a shortcut only when a new thumbnail is needed. A cached
             // texture does not need to touch the link or its target again.
-            let (kind, svg, link_target) = match thumbnail_kind_for_row(row.kind, row.ext.as_str())
-            {
-                Some((kind, svg)) => (kind, svg, None),
-                None if row.ext.eq_ignore_ascii_case("lnk") => match lnk_thumbnail_kind(&full) {
-                    Some((kind, target)) => (kind, false, Some(target)),
-                    None => continue,
-                },
-                None => continue,
+            let Some((kind, svg, link_target)) = thumbnail_kind_for_file_row(state, &row, &full)
+            else {
+                continue;
             };
             push_thumbnail_request(
                 &mut requests,
@@ -15899,7 +15382,8 @@ fn update_panel_render_window(
             }
         } else if preview
             && !probing
-            && thumbnail_kind_for_row(row.kind, row.ext.as_str()).is_some()
+            && (thumbnail_kind_for_row(row.kind, row.ext.as_str()).is_some()
+                || cfg!(windows) && row.ext == "lnk")
             && !row.content_remote
             && row.thumbnail.size().width == 0
         {
@@ -15910,14 +15394,15 @@ fn update_panel_render_window(
                 row.thumbnail = img;
                 row_changed = true;
             } else if !state.thumb_cache.borrow().failed.contains(&key)
-                && let Some((kind, svg)) = thumbnail_kind_for_row(row.kind, row.ext.as_str())
+                && let Some((kind, svg, link_target)) =
+                    thumbnail_kind_for_file_row(state, &row, &full)
             {
                 push_thumbnail_request(
                     &mut requests,
                     full,
                     kind,
                     svg,
-                    None,
+                    link_target,
                     ThumbLocation {
                         panel: panel_idx,
                         row: index,
@@ -15944,6 +15429,8 @@ fn update_panel_render_window(
             .thumb_scheduler
             .merge_pending(requests.into_values().collect());
     }
+    #[cfg(windows)]
+    row_icons::RowIcons::refresh(state);
 
     if visible.0 < visible.1 {
         (visible.0 as i32, visible.1 as i32 - 1)
@@ -16371,7 +15858,7 @@ fn zoom_panel_visuals(
         .collect();
 
     if crossed_mode {
-        refresh_rows_visuals(&mut rows, preview, compact_icon_rows, false);
+        refresh_rows_visuals(&mut rows, preview);
     }
 
     layout_rows(&mut rows, zoom, compact_icon_rows, item_spacing);
@@ -16390,19 +15877,13 @@ fn zoom_panel_visuals(
     anchored_top
 }
 
-fn refresh_rows_visuals(rows: &mut [FileRow], preview: bool, compact_icon_rows: bool, grid: bool) {
+fn refresh_rows_visuals(rows: &mut [FileRow], preview: bool) {
     for row in rows {
-        let use_large_icon = grid || preview && (!compact_icon_rows || row.preview_capable);
-        let (app_icon, link_folder) = row_app_icon(
-            row.path.as_str(),
-            row.name.as_str(),
-            row.ext.as_str(),
-            row.is_dir,
-            row.content_remote,
-            use_large_icon,
-        );
-        row.app_icon = app_icon;
-        row.link_folder = link_folder;
+        // The cached image for the new display size will be attached to visible rows.
+        #[cfg(windows)]
+        {
+            row.app_icon = Image::default();
+        }
         if !preview {
             row.thumbnail = Image::default();
         }
@@ -16420,8 +15901,7 @@ fn refresh_panel_visuals(
     let mut rows: Vec<FileRow> = (0..panel.rows_model.row_count())
         .filter_map(|index| panel.rows_model.row_data(index))
         .collect();
-    let grid = panel.tabs.tabs[panel.tabs.active].item_arrangement == ItemArrangement::Grid;
-    refresh_rows_visuals(&mut rows, preview, compact_icon_rows, grid);
+    refresh_rows_visuals(&mut rows, preview);
     layout_rows(&mut rows, zoom, compact_icon_rows, item_spacing);
     panel.replace_rows(rows);
 }
@@ -16549,9 +16029,8 @@ fn ext_app_icon(ext: &str, big: bool) -> Image {
 thread_local! {
     /// Cache of icons SPECIFIC to a path by `(path, jumbo?)` — a single
     /// shell extraction per file/size and per session. Essential:
-    /// unlike the per-extension cache, this path does disk I/O (reading
-    /// the binary's resources or Shell-resolving a `.lnk`) and `entry_to_row`
-    /// is replayed on every sort/filter.
+    /// favorites, recovery and the properties dialog can ask for the same icon
+    /// again. Windows file-list rows use the background cache in `row_icons`.
     static SELF_ICON_CACHE: RefCell<HashMap<(String, bool), Option<Image>>> =
         RefCell::new(HashMap::new());
 }
@@ -16559,6 +16038,7 @@ thread_local! {
 /// Does this file type carry its OWN icon (≠ generic icon for its
 /// extension)? Executables and related types generally embed their own
 /// resource, which must be resolved by path rather than by extension.
+#[cfg(any(windows, test))]
 fn has_own_icon(ext: &str) -> bool {
     matches!(ext, "exe" | "scr" | "cpl" | "ico")
 }
@@ -16683,104 +16163,6 @@ fn cached_link_target(path: &Path) -> Option<LinkTarget> {
     target
 }
 
-/// Icon of a `.lnk` shortcut. For a file target (or an unresolved one), the LINK's
-/// PATH is submitted to the Shell first: it's the one that knows the `IconLocation`
-/// possibly stored in the shortcut and the target's own icon. Manual
-/// resolution now only serves the historical "folder + arrow" rendering
-/// and the extension fallback if the Shell renders nothing.
-/// `None` = unresolved or unavailable link (generic `.lnk` icon), or non-Windows.
-fn resolve_lnk_icon(parent_display: &str, name: &str, big: bool) -> Option<(Image, bool)> {
-    #[cfg(windows)]
-    {
-        let path = std::path::PathBuf::from(parent_display).join(name);
-        match cached_link_target(&path) {
-            // Keeps the explicit historical "folder + arrow" rendering: a
-            // non-empty Shell image would take priority over this SVG in Slint.
-            Some(LinkTarget { is_dir: true, .. }) => Some((Image::default(), true)),
-            Some(target) => Some((
-                crate::cloud_content_guard::may_read_automatically(&target.path)
-                    .then(|| cached_path_icon(&path, big))
-                    .flatten()
-                    .unwrap_or_else(|| ext_app_icon(&target.ext, big)),
-                false,
-            )),
-            None => None,
-        }
-    }
-    #[cfg(not(windows))]
-    {
-        let _ = (parent_display, name, big);
-        None
-    }
-}
-
-/// If `lnk_path` is a Windows `.lnk` pointing at a file Favnyr can preview
-/// (image / audio / video / PDF), returns the TARGET's thumbnail kind — so an image
-/// shortcut previews the image, like Explorer. Reuses the icon path's
-/// `LNK_TARGET_CACHE`, so it adds no COM call the icon didn't already make.
-/// `None` on non-Windows, for a folder target, or a non-previewable one.
-fn lnk_thumbnail_kind(lnk_path: &Path) -> Option<(FileKind, PathBuf)> {
-    #[cfg(windows)]
-    {
-        let target = cached_link_target(lnk_path)?;
-        if target.is_dir || !crate::cloud_content_guard::may_read_automatically(&target.path) {
-            return None;
-        }
-        if rfs::ambiguous::rule_for_extension(&target.ext).is_some() {
-            return Some((FileKind::File, target.path));
-        }
-        thumbnail_kind_for_row(
-            rfs::classify_kind(Some(&target.ext), false).as_i32(),
-            &target.ext,
-        )
-        .map(|(kind, _)| (kind, target.path))
-    }
-    #[cfg(not(windows))]
-    {
-        let _ = lnk_path;
-        None
-    }
-}
-
-/// Resolves a row's OS icon from only the information already present
-/// in the model. This route is shared by the initial listing and the
-/// List/Previews toggle, which therefore no longer need to re-read the folder.
-fn row_app_icon(
-    parent_display: &str,
-    name: &str,
-    ext: &str,
-    is_dir: bool,
-    content_remote: bool,
-    big: bool,
-) -> (Image, bool) {
-    if is_dir {
-        return (Image::default(), false);
-    }
-    if content_remote {
-        return (ext_app_icon(ext, big), false);
-    }
-    // A launcher shows the application it starts, like everywhere else on the
-    // desktop — a row of identical generic icons says nothing about which game
-    // or program each entry actually is.
-    #[cfg(not(windows))]
-    if ext == "desktop"
-        && let Some(icon) = cached_desktop_icon(&Path::new(parent_display).join(name))
-    {
-        return (icon, false);
-    }
-    if ext == "lnk" {
-        return resolve_lnk_icon(parent_display, name, big)
-            .unwrap_or_else(|| (ext_app_icon(ext, big), false));
-    }
-    if has_own_icon(ext) {
-        return (
-            self_icon(&Path::new(parent_display).join(name), ext, big),
-            false,
-        );
-    }
-    (ext_app_icon(ext, big), false)
-}
-
 /// Parses the extension filter's free text into lowercase extensions
 /// without a dot. FLEXIBLE syntax: comma AND/OR space separators
 /// ("jpg, png", "jpg png", ".JPG,.PNG" → `["jpg","png"]`). Empty if nothing.
@@ -16810,49 +16192,6 @@ fn apply_ext_filter(entries: &mut Vec<Entry>, on: bool, filter: &str) {
     });
 }
 
-/// Reconciles and applies a directory's explicit order after the regular sort has
-/// established a deterministic starting point. `entries` must be a complete
-/// listing, including hidden items, so names missing from disk can be removed
-/// without confusing them with entries hidden only from the current display.
-fn apply_manual_order(
-    state: &AppState,
-    directory: &Path,
-    entries: &mut Vec<Entry>,
-    show_hidden: bool,
-) -> bool {
-    let names: Vec<String> = entries.iter().map(|entry| entry.name.clone()).collect();
-    let (order, changed) = {
-        let mut folder_state = folder_state_for_update(state);
-        let changed = folder_state.reconcile(directory, &names);
-        let order = folder_state.order(directory).map(<[String]>::to_vec);
-        if changed {
-            save_folder_state(state, &folder_state);
-        }
-        (order, changed)
-    };
-    let Some(order) = order else {
-        if !show_hidden {
-            entries.retain(|entry| !entry.hidden);
-        }
-        return false;
-    };
-    let ranks: HashMap<&str, usize> = order
-        .iter()
-        .enumerate()
-        .map(|(index, name)| (name.as_str(), index))
-        .collect();
-    entries.sort_by_key(|entry| {
-        ranks
-            .get(entry.name.as_str())
-            .copied()
-            .unwrap_or(usize::MAX)
-    });
-    if !show_hidden {
-        entries.retain(|entry| !entry.hidden);
-    }
-    changed
-}
-
 fn effective_group_mode(group_mode: GroupMode, manual_order: bool) -> GroupMode {
     if manual_order {
         GroupMode::Mixed
@@ -16869,8 +16208,6 @@ fn effective_group_mode(group_mode: GroupMode, manual_order: bool) -> GroupMode 
 struct RowContext<'a> {
     lang: Lang,
     now_unix: i64,
-    big_icon: bool,
-    grid: bool,
     zoom: i32,
     compact_icon_rows: bool,
     item_spacing: i32,
@@ -16889,9 +16226,6 @@ fn entry_to_row(e: &Entry, parent_display: &str, ctx: &RowContext) -> FileRow {
     let RowContext {
         lang,
         now_unix,
-        big_icon,
-        grid,
-        compact_icon_rows,
         annotations,
         ..
     } = *ctx;
@@ -16962,20 +16296,14 @@ fn entry_to_row(e: &Entry, parent_display: &str, ctx: &RowContext) -> FileRow {
             && ctx
                 .thumb_cache
                 .is_some_and(|cache| cache.borrow().contains(e.path.to_string_lossy().as_ref()));
-    // Actual OS app icon for this extension — empty for a folder
-    // or if unavailable (falls back to the view's type icon). Cached.
-    // Resolution suited to the mode: 256 px in previews (enlarged), 32 px in list.
-    // For `.lnk` shortcuts: we resolve the target → target app icon
-    // (file) OR "folder + arrow" marker (folder) via `link_folder`.
-    let use_large_icon = grid || big_icon && (!compact_icon_rows || preview_capable);
-    let (app_icon, link_folder) = row_app_icon(
-        parent_display,
-        &e.name,
-        &ext_raw,
-        e.is_dir,
-        e.content_remote,
-        use_large_icon,
-    );
+    #[cfg(windows)]
+    let app_icon = Image::default();
+    #[cfg(not(windows))]
+    let app_icon = if ext_raw == "desktop" {
+        cached_desktop_icon(&e.path).unwrap_or_default()
+    } else {
+        Image::default()
+    };
     FileRow {
         name: e.name.clone().into(),
         name_base: name_base.into(),
@@ -17007,7 +16335,7 @@ fn entry_to_row(e: &Entry, parent_display: &str, ctx: &RowContext) -> FileRow {
         // preview mode, or immediately from the cache in update_panels_ui.
         thumbnail: slint::Image::default(),
         app_icon,
-        link_folder,
+        link_folder: false,
         preview_capable,
         visual_y: 0.0,
         visual_h: COMPACT_ICON_ROW_HEIGHT,
@@ -17226,8 +16554,12 @@ fn count_selected<M: slint::Model<Data = FileRow>>(model: &M) -> i32 {
 /// "follow" an entry that was just created. (Reusable for other
 /// "reveal this entry" cases.)
 fn focus_entry_by_name(window: &MainWindow, state: &AppState, name: &str) {
+    let dir = state.current_path();
+    if defer_entry_focus(state, &dir, name) {
+        return;
+    }
     let model = state.active_rows_model();
-    let target = state.current_path().join(name);
+    let target = dir.join(name);
     let idx =
         (0..model.row_count()).find(|&i| model.row_data(i).is_some_and(|r| row_path(&r) == target));
     let Some(idx) = idx.map(|i| i as i32) else {
@@ -17270,7 +16602,7 @@ fn defer_entry_focus(state: &AppState, parent: &Path, name: &str) -> bool {
     let active = *state.active_panel.borrow();
     let mut panels = state.panels.borrow_mut();
     if let Some(panel) = panels.get_mut(active)
-        && panel.pending_listing
+        && panel.pending_listing.is_some()
         && panel.tabs.group_page().is_none()
         && ops::paths_equal(&panel.tabs.tabs[panel.tabs.active].current_path, parent)
     {
@@ -17337,12 +16669,9 @@ fn upward_navigation_child_name(target: &Path, left: &Path) -> Option<String> {
 /// child → cursor + highlight + scroll-into-view. No-op otherwise (going back to a
 /// folder with no parent-child relation).
 fn select_child_from(window: &MainWindow, state: &AppState, target: &Path, left: &Path) {
-    if let Some(name) = upward_navigation_child_name(target, left) {
-        // On network, the listing is still on the worker: remember the target
-        // and apply it atomically along with the delivered rows.
-        if defer_entry_focus(state, target, &name) {
-            return;
-        }
+    if let Some(name) = upward_navigation_child_name(target, left)
+        && !defer_entry_focus(state, target, &name)
+    {
         schedule_focus_entry_by_name(window, state, target.to_path_buf(), name);
     }
 }
@@ -20934,17 +20263,62 @@ mod tests {
 
     #[test]
     fn async_listing_only_accepts_the_latest_matching_navigation() {
-        let path = PathBuf::from("network-a");
+        let path = PathBuf::from("folder-a");
         let mut panel = Panel::with_mode(path.clone(), columns::default_columns(), 0, false);
-        panel.pending_listing = true;
-        panel.listing_gen = 7;
+        panel.pending_listing = Some(PendingListing::new(7));
+        let cancelled = panel.pending_listing.as_ref().unwrap().cancelled.clone();
 
         assert!(async_listing_is_current(&panel, 7, &path));
         assert!(!async_listing_is_current(&panel, 6, &path));
-        assert!(!async_listing_is_current(&panel, 7, Path::new("network-b")));
+        assert!(!async_listing_is_current(&panel, 7, Path::new("folder-b")));
 
-        panel.pending_listing = false;
+        // Leaving and coming back to the same path still supersedes the old request.
+        panel.pending_listing = Some(PendingListing::new(8));
+        assert!(cancelled.load(Ordering::Relaxed));
         assert!(!async_listing_is_current(&panel, 7, &path));
+        assert!(async_listing_is_current(&panel, 8, &path));
+    }
+
+    #[test]
+    fn async_listing_navigation_discards_a_local_result_already_waiting_for_delivery() {
+        crate::test_support::run(|| {
+            let window = MainWindow::new().unwrap();
+            let base = Path::new(env!("CARGO_MANIFEST_DIR"));
+            let first = base.join("src");
+            let second = base.join("i18n");
+            let state = AppState::new_at(Config::default(), base.to_path_buf(), 0);
+            let receive = || {
+                let deadline = Instant::now() + Duration::from_secs(5);
+                loop {
+                    if let Some(delivery) = state.async_listings.lock().unwrap().pop_front() {
+                        return delivery;
+                    }
+                    assert!(Instant::now() < deadline, "listing worker did not deliver");
+                    std::thread::sleep(Duration::from_millis(2));
+                }
+            };
+
+            load_directory(&window, &state, &first, true);
+            let late = receive();
+            assert_eq!(late.path, first);
+            assert!(late.result.is_ok());
+            load_directory(&window, &state, &second, true);
+            assert_eq!(state.current_path(), second);
+            assert_eq!(state.active_rows_model().row_count(), 0);
+
+            apply_async_listing(&window, &state, late);
+            assert_eq!(state.current_path(), second);
+            assert_eq!(state.active_rows_model().row_count(), 0);
+
+            focus_entry_by_name(&window, &state, "ja.toml");
+            apply_async_listing(&window, &state, receive());
+            let rows = state.active_rows_model();
+            assert!(rows.iter().any(|row| row.name == "ja.toml" && row.selected));
+            assert!(
+                rows.iter()
+                    .all(|row| row_path(&row).parent() == Some(&second))
+            );
+        });
     }
 
     #[cfg(windows)]

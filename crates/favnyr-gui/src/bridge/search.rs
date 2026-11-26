@@ -251,8 +251,7 @@ pub(super) fn start(window: &MainWindow, state: &AppState, index: usize, query: 
             skipped: 0,
             limited: false,
         });
-        panel.pending_initial = false;
-        panel.pending_listing = false;
+        panel.pending_listing = None;
         panel.pending_select = None;
         panel.unavailable = false;
         panel.listing_failed = false;
@@ -473,8 +472,6 @@ fn append(state: &AppState, index: usize) {
     let context = RowContext {
         lang: config.language,
         now_unix: now_unix(),
-        big_icon: tab.preview,
-        grid: tab.item_arrangement == ItemArrangement::Grid,
         zoom: tab.zoom,
         compact_icon_rows: config.compact_icon_rows_in_preview,
         item_spacing: config.view_item_spacing,
@@ -482,8 +479,7 @@ fn append(state: &AppState, index: usize) {
         annotations: &annotations,
         thumb_cache: Some(&state.thumb_cache),
     };
-    // Shell icon lookups can be expensive. Yield between entries instead of
-    // turning one delivery into a long, uninterrupted UI-thread conversion.
+    // Yield between entries to keep large result deliveries responsive.
     let started = Instant::now();
     let mut entries = Vec::new();
     let mut rows = Vec::new();
@@ -984,8 +980,6 @@ mod tests {
         let context = RowContext {
             lang: Lang::En,
             now_unix: 0,
-            big_icon: false,
-            grid: false,
             zoom: LIST_DEFAULT_ZOOM,
             compact_icon_rows: false,
             item_spacing: 0,

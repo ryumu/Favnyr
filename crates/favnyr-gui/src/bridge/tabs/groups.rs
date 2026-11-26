@@ -122,6 +122,10 @@ pub(super) fn publish(window: &MainWindow, state: &AppState, panel: usize) {
         .get(panel)
         .is_some_and(|p| p.tabs.group_page().is_some());
     if group_page {
+        if let Some(panel) = state.panels.borrow_mut().get_mut(panel) {
+            panel.pending_listing = None;
+            panel.pending_select = None;
+        }
         crate::bridge::search::clear(state, panel);
         if panel == *state.active_panel.borrow() {
             state.filter.borrow_mut().clear();

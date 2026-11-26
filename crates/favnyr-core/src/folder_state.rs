@@ -123,6 +123,11 @@ impl FolderStateStore {
         let Some(order) = self.order_mut(directory) else {
             return false;
         };
+        Self::reconcile_order(order, names)
+    }
+
+    /// Reconciles a snapshot of one folder's manual order against a complete listing.
+    pub fn reconcile_order(order: &mut Vec<String>, names: &[String]) -> bool {
         let previous = order.clone();
         let existing: HashSet<&str> = names.iter().map(String::as_str).collect();
         let mut seen = HashSet::new();

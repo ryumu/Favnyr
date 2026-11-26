@@ -293,16 +293,14 @@ export component MainWindow inherits Window {
     callback match-action(string, bool, bool, bool, bool) -> string;
     /// Emitted by the bridge when a thumbnail is ready (full path, generation, image).
     callback thumb-ready(string, int, image, bool);
+    callback row-icons-ready();
     /// Exact viewport of a panel: drives virtualization and prioritization.
     callback panel-viewport-changed(int, length, length, ItemGrid) -> length;
     callback panel-item-at-content-point(int, length, length, ItemGrid) -> int;
     pure callback grid-layout(length, int, length, length, length) -> ItemGrid;
     pure callback grid-item-rect(ItemGrid, int) -> ItemRect;
     pure callback grid-insertion-gap(ItemGrid, int, length, length, bool) -> int;
-    /// Wakes the UI thread from the INITIAL FILL thread: drains
-    /// the channel of delivered listings (the Rust handler captured the AppState).
-    callback initial-listing-drain();
-    /// Ordinary background listings delivered off-UI, with an anti-race generation.
+    /// Wakes the UI thread to apply completed folder listings.
     callback async-listing-drain();
     // Wakes the bridge to drain typed recursive folder statistics.
     callback folder-stats-drain();
